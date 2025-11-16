@@ -326,6 +326,44 @@ uv run graphiti_mcp_server.py --config config/config-docker-falkordb.yaml
 - `--group-id`: Set a namespace for the graph (optional). If not provided, defaults to "main"
 - `--destroy-graph`: If set, destroys all Graphiti graphs on startup
 
+#### Overriding `group_id` via HTTP headers or query params
+
+When running the MCP server over HTTP/SSE, you can override the active `group_id` per request
+by sending an `X-Group-ID` header **or** by appending a `group_id` query parameter to the URL
+(`http://localhost:8000/mcp/?group_id=ProjectA`). This makes it easy to share a single Graphiti deployment across
+multiple logical tenants or projects without running multiple containers.
+
+Example `.cursor/mcp.json` configuration that mounts the same endpoint twice with different
+group isolation:
+
+```json
+{
+  "mcpServers": {
+    "graphiti-ProjectA": {
+      "url": "http://localhost:8000/mcp/",
+      "headers": {
+        "X-Group-ID": "ProjectA"
+      }
+    },
+    "graphiti-ProjectB": {
+      "url": "http://localhost:8000/mcp/",
+      "headers": {
+        "X-Group-ID": "ProjectB"
+      }
+    }
+  }
+}
+```
+
+You can also specify the `group_id` in the URL itself:
+
+```text
+http://localhost:8000/mcp/?group_id=ProjectA
+```
+
+If neither the header nor the query parameter is provided, the server falls back to the `group_id`
+argument supplied to each tool, and finally to the default configured in `config.yaml`.
+
 ### Concurrency and LLM Provider 429 Rate Limit Errors
 
 Graphiti's ingestion pipelines are designed for high concurrency, controlled by the `SEMAPHORE_LIMIT` environment variable. This setting determines how many episodes can be processed simultaneously. Since each episode involves multiple LLM calls (entity extraction, deduplication, summarization), the actual number of concurrent LLM requests will be several times higher.

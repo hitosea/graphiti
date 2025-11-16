@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import sys
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Optional
 
@@ -19,6 +20,8 @@ from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from config.schema import GraphitiConfig, ServerConfig
@@ -108,6 +111,60 @@ def configure_uvicorn_logging():
 
 
 logger = logging.getLogger(__name__)
+
+GROUP_ID_HEADER = 'X-Group-ID'
+_request_group_id: ContextVar[str | None] = ContextVar(
+    'graphiti_request_group_id', default=None
+)
+
+
+def _normalize_group_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+class GroupIDMiddleware(BaseHTTPMiddleware):
+    """Extract the group identifier from incoming HTTP headers or query params."""
+
+    async def dispatch(self, request: Request, call_next):
+        group_value = _normalize_group_id(request.headers.get(GROUP_ID_HEADER))
+        if not group_value:
+            group_value = _normalize_group_id(request.query_params.get('group_id'))
+        token = _request_group_id.set(group_value)
+        try:
+            response = await call_next(request)
+        finally:
+            _request_group_id.reset(token)
+        return response
+
+
+def get_request_group_id() -> str | None:
+    """Return the per-request group_id provided via X-Group-ID header."""
+    return _request_group_id.get()
+
+
+def resolve_group_id(explicit_group_id: str | None = None) -> str | None:
+    """Resolve a single group_id using tool args, headers, and config defaults."""
+    return (
+        _normalize_group_id(explicit_group_id)
+        or get_request_group_id()
+        or config.graphiti.group_id
+    )
+
+
+def resolve_group_ids(explicit_group_ids: list[str] | None = None) -> list[str]:
+    """Resolve list of group_ids honoring headers and config defaults."""
+    if explicit_group_ids is not None:
+        return explicit_group_ids
+
+    header_group_id = get_request_group_id()
+    if header_group_id:
+        return [header_group_id]
+
+    return [config.graphiti.group_id] if config.graphiti.group_id else []
+
 
 # Create global config instance - will be properly initialized later
 config: GraphitiConfig
@@ -371,8 +428,13 @@ async def add_memory(
         return ErrorResponse(error='Services not initialized')
 
     try:
-        # Use the provided group_id or fall back to the default from config
-        effective_group_id = group_id or config.graphiti.group_id
+        # Use the provided group_id, request header, or fall back to the default from config
+        effective_group_id = resolve_group_id(group_id)
+        if not effective_group_id:
+            return ErrorResponse(
+                error='No group_id available. Provide one via the tool argument, X-Group-ID header, '
+                'or server configuration.'
+            )
 
         # Try to parse the source as an EpisodeType enum, with fallback to text
         episode_type = EpisodeType.text  # Default
@@ -427,14 +489,8 @@ async def search_nodes(
     try:
         client = await graphiti_service.get_client()
 
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids
-            if group_ids is not None
-            else [config.graphiti.group_id]
-            if config.graphiti.group_id
-            else []
-        )
+        # Use the provided group_ids, request header, or fall back to the default from config
+        effective_group_ids = resolve_group_ids(group_ids)
 
         # Create search filters
         search_filters = SearchFilters(
@@ -511,14 +567,8 @@ async def search_memory_facts(
 
         client = await graphiti_service.get_client()
 
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids
-            if group_ids is not None
-            else [config.graphiti.group_id]
-            if config.graphiti.group_id
-            else []
-        )
+        # Use the provided group_ids, request header, or fall back to the default from config
+        effective_group_ids = resolve_group_ids(group_ids)
 
         relevant_edges = await client.search(
             group_ids=effective_group_ids,
@@ -636,14 +686,8 @@ async def get_episodes(
     try:
         client = await graphiti_service.get_client()
 
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids
-            if group_ids is not None
-            else [config.graphiti.group_id]
-            if config.graphiti.group_id
-            else []
-        )
+        # Use the provided group_ids, request header, or fall back to the default from config
+        effective_group_ids = resolve_group_ids(group_ids)
 
         # Get episodes from the driver directly
         from graphiti_core.nodes import EpisodicNode
@@ -700,10 +744,8 @@ async def clear_graph(group_ids: list[str] | None = None) -> SuccessResponse | E
     try:
         client = await graphiti_service.get_client()
 
-        # Use the provided group_ids or fall back to the default from config if none provided
-        effective_group_ids = (
-            group_ids or [config.graphiti.group_id] if config.graphiti.group_id else []
-        )
+        # Use the provided group_ids, request header, or fall back to the default from config
+        effective_group_ids = resolve_group_ids(group_ids)
 
         if not effective_group_ids:
             return ErrorResponse(error='No group IDs specified for clearing')
@@ -919,7 +961,20 @@ async def run_mcp_server():
             f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}'
         )
         logger.info(f'Access the server at: http://{mcp.settings.host}:{mcp.settings.port}/sse')
-        await mcp.run_sse_async()
+        configure_uvicorn_logging()
+        import uvicorn
+
+        starlette_app = mcp.sse_app()
+        starlette_app.add_middleware(GroupIDMiddleware)
+
+        config = uvicorn.Config(
+            starlette_app,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
     elif mcp_config.transport == 'http':
         # Use localhost for display if binding to 0.0.0.0
         display_host = 'localhost' if mcp.settings.host == '0.0.0.0' else mcp.settings.host
@@ -942,7 +997,19 @@ async def run_mcp_server():
         # Configure uvicorn logging to match our format
         configure_uvicorn_logging()
 
-        await mcp.run_streamable_http_async()
+        import uvicorn
+
+        starlette_app = mcp.streamable_http_app()
+        starlette_app.add_middleware(GroupIDMiddleware)
+
+        config = uvicorn.Config(
+            starlette_app,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
     else:
         raise ValueError(
             f'Unsupported transport: {mcp_config.transport}. Use "sse", "stdio", or "http"'
